@@ -47,7 +47,7 @@ python -m ostrace.handler
 uvicorn ostrace.handler:app --host 0.0.0.0 --port 8000
 ```
 
-### Веб-интерфейс
+### Веб-интерфейс(ПЛЕЙСХОЛДЕР!)
 
 Запуск веб-интерфейса:
 
@@ -141,3 +141,4 @@ curl http://localhost:8000/health
 - Pillow
 - pydantic 
 - pydicom
+
