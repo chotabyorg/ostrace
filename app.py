@@ -6,6 +6,8 @@ import io
 import base64
 import numpy as np
 import cv2
+import os
+import sys
 
 from .gradcam import GradCAMVisualizer
 from .inference import FractureDetector, Config, encode_image_to_base64, load_dicom
@@ -33,6 +35,7 @@ class XRayStandaloneApp(ctk.CTk):
         self.empty_ctk_img = ctk.CTkImage(light_image=empty_pil, dark_image=empty_pil, size=(1, 1))
 
         self._setup_ui()
+        self.after(100, self._auto_load_model)
 
     def _setup_ui(self):
         self.title(APP_TITLE)
@@ -83,6 +86,36 @@ class XRayStandaloneApp(ctk.CTk):
         # Загружаем тяжелую модель в фоне, чтобы не вешать UI
         threading.Thread(target=self._init_model_backend, args=(path,), daemon=True).start()
 
+    def _auto_load_model(self):
+        # 1. Определяем, где лежит наша программа
+        if getattr(sys, 'frozen', False):
+            if sys.platform == "darwin" and "MacOS" in sys.executable:
+                # Если это Mac .app файл: спускаемся на 4 уровня вверх из папки Contents/MacOS/
+                base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(sys.executable))))
+            else:
+                base_dir = os.path.dirname(sys.executable)
+        else:
+            # Если запускаем из PyCharm
+            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+        # 2. Ищем папку models рядом с программой
+        models_dir = os.path.join(base_dir, "models")
+
+        if os.path.exists(models_dir):
+            for file in os.listdir(models_dir):
+                if file.endswith((".keras", ".h5")):
+                    model_path = os.path.join(models_dir, file)
+                    print(f"Найдена модель по умолчанию: {model_path}")
+
+                    self.btn_load_model.configure(state="disabled")
+                    self.status_label.configure(text="Авто-загрузка модели...\n(может занять 10-15 сек)",
+                                                text_color=COLOR_WARN)
+
+                    threading.Thread(target=self._init_model_backend, args=(model_path,), daemon=True).start()
+                    return
+
+        print("Папка models не найдена или пуста. Ждем ручной загрузки.")
+
     def _init_model_backend(self, model_path):
         try:
             # Инициализация детекторов из кода ML-инженеров
@@ -109,7 +142,7 @@ class XRayStandaloneApp(ctk.CTk):
 
     def _on_model_loaded_success(self):
         self.status_label.configure(text="Модель активна! ✅", text_color=COLOR_OK)
-        self.btn_load_model.configure(text="Модель загружена", fg_color="gray30", state="normal")
+        self.btn_load_model.configure(text="Сменить модель", fg_color="gray30", state="normal")
         self.btn_load_img.configure(state="normal")
         if self.gradcam:
             self.cb_gradcam.configure(state="normal")
