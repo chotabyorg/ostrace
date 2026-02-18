@@ -24,12 +24,10 @@ ctk.set_default_color_theme("blue")
 class XRayStandaloneApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.image_path = None
         self.detector = None
         self.gradcam = None
 
-        self.current_orig_img = None
-        self.current_res_img = None
+        self.image_refs = []
 
         empty_pil = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
         self.empty_ctk_img = ctk.CTkImage(light_image=empty_pil, dark_image=empty_pil, size=(1, 1))
@@ -57,9 +55,9 @@ class XRayStandaloneApp(ctk.CTk):
         # Разделитель
         ctk.CTkFrame(self.sidebar, height=2, fg_color="gray30").pack(fill="x", padx=20, pady=10)
 
-        # Кнопка загрузки снимка
-        self.btn_load_img = ctk.CTkButton(self.sidebar, text="📂 Загрузить снимок",
-                                          command=self.load_image, state="disabled")
+        # Кнопка загрузки снимков
+        self.btn_load_img = ctk.CTkButton(self.sidebar, text="📂 Загрузить снимки",
+                                          command=self.load_images, state="disabled")
         self.btn_load_img.pack(padx=20, pady=10)
 
         # Чекбокс для Grad-CAM (Тепловая карта)
@@ -72,31 +70,8 @@ class XRayStandaloneApp(ctk.CTk):
         self.status_label.pack(side="bottom", pady=20)
 
         # --- ОБЛАСТЬ КОНТЕНТА ---
-        self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.content_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
-
-        self.content_frame.columnconfigure(0, weight=1)
-        self.content_frame.columnconfigure(1, weight=1)
-
-        # Исходное фото
-        self.lbl_orig_title = ctk.CTkLabel(self.content_frame, text="Исходный снимок", font=("Arial", 14, "bold"))
-        self.lbl_orig_title.grid(row=0, column=0, pady=5)
-        self.img_label_orig = ctk.CTkLabel(self.content_frame, text="Нет изображения")
-        self.img_label_orig.grid(row=1, column=0, padx=10, sticky="nsew")
-
-        # Обработанное фото
-        self.lbl_res_title = ctk.CTkLabel(self.content_frame, text="Результат AI (Сегментация / Внимание)",
-                                          font=("Arial", 14, "bold"))
-        self.lbl_res_title.grid(row=0, column=1, pady=5)
-        self.img_label_res = ctk.CTkLabel(self.content_frame, text="Ожидание...")
-        self.img_label_res.grid(row=1, column=1, padx=10, sticky="nsew")
-
-        # --- ПАНЕЛЬ ВЕРДИКТА ---
-        self.verdict_frame = ctk.CTkFrame(self.content_frame, height=100)
-        self.verdict_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(20, 0))
-
-        self.lbl_verdict = ctk.CTkLabel(self.verdict_frame, text="...", font=("Arial", 24, "bold"))
-        self.lbl_verdict.pack(expand=True)
+        self.scroll_frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.scroll_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
 
     def load_model(self):
         path = filedialog.askopenfilename(filetypes=[("Keras Model", "*.keras *.h5")])
@@ -144,51 +119,105 @@ class XRayStandaloneApp(ctk.CTk):
         self.btn_load_model.configure(state="normal")
         messagebox.showerror("ML Engine Error", f"Не удалось загрузить модель:\n{err_msg}")
 
-    def load_image(self):
+    def load_images(self):
         if not self.detector:
             messagebox.showwarning("Внимание", "Сначала загрузите модель!")
             return
 
-        path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.png *.jpeg *.dcm")])
-        if not path: return
-        self.image_path = path
+        paths = filedialog.askopenfilenames(filetypes=[("Images", "*.jpg *.png *.jpeg *.dcm")])
+        if not paths: return
 
-        self.display_image(path, self.img_label_orig)
-        self.img_label_res.configure(image=self.empty_ctk_img, text="Нейросеть анализирует...")
-        self.lbl_verdict.configure(text="Анализ...", text_color="white")
+        # Очищаем ленту от предыдущих результатов
+        for widget in self.scroll_frame.winfo_children():
+            widget.destroy()
+        self.image_refs.clear()
 
-        threading.Thread(target=self.run_inference, daemon=True).start()
+        tasks = []
 
-    def run_inference(self):
-        try:
-            # 1. Загрузка изображения в виде массива
-            if self.image_path.lower().endswith(('.dcm', '.dicom')):
-                image_array = load_dicom(self.image_path)
-            else:
-                image_array = np.array(Image.open(self.image_path).convert("RGB"), dtype=np.float32) / 255.0
+        # Динамически создаем UI-карточку для каждого снимка
+        for i, path in enumerate(paths):
+            row_frame = ctk.CTkFrame(self.scroll_frame, corner_radius=10)
+            row_frame.pack(fill="x", pady=15, padx=10)
 
-            # 2. Прямой вызов модели (передаем готовый массив, а не путь)
-            result = self.detector.predict(image_array, return_visualization=True)
+            # Заголовок карточки с именем файла
+            filename = path.split("/")[-1]
+            title = ctk.CTkLabel(row_frame, text=f"Снимок {i + 1}: {filename}", font=("Arial", 16, "bold"))
+            title.pack(pady=(10, 5))
 
-            # 3. Опционально: генерация Grad-CAM
-            gradcam_base64 = None
-            if self.use_gradcam_var.get() and self.gradcam is not None:
-                image_size = self.detector.config.image_size
-                image_resized = cv2.resize(image_array, (image_size, image_size))
+            # Контейнер для двух картинок
+            imgs_frame = ctk.CTkFrame(row_frame, fg_color="transparent")
+            imgs_frame.pack(fill="x", pady=5)
+            imgs_frame.columnconfigure(0, weight=1)
+            imgs_frame.columnconfigure(1, weight=1)
 
-                overlay = self.gradcam.visualize(image_resized)
-                original_h, original_w = image_array.shape[:2]
-                overlay = cv2.resize(overlay, (original_w, original_h))
-                gradcam_base64 = encode_image_to_base64(overlay)
+            lbl_orig = ctk.CTkLabel(imgs_frame, text="Загрузка...", font=("Arial", 12))
+            lbl_orig.grid(row=0, column=0, padx=10, pady=5)
 
-            # Передаем результаты в UI поток
-            self.after(0, lambda: self.update_ui_success(result, gradcam_base64))
+            lbl_res = ctk.CTkLabel(imgs_frame, text="Ожидание очереди...", font=("Arial", 12))
+            lbl_res.grid(row=0, column=1, padx=10, pady=5)
 
-        except Exception as e:
-            print(f"Inference error: {e}")
-            self.after(0, lambda: self.lbl_verdict.configure(text="Ошибка анализа", text_color=COLOR_ALERT))
+            # Вердикт внизу карточки
+            lbl_verdict = ctk.CTkLabel(row_frame, text="Ожидание...", font=("Arial", 20, "bold"))
+            lbl_verdict.pack(pady=(5, 15))
 
-    def update_ui_success(self, result, gradcam_base64):
+            # Сразу показываем оригинальную картинку, чтобы интерфейс не казался зависшим
+            self.display_image(path, lbl_orig)
+
+            # Сохраняем ссылки на элементы UI, чтобы передать их в поток анализа
+            tasks.append({
+                "path": path,
+                "lbl_res": lbl_res,
+                "lbl_verdict": lbl_verdict
+            })
+
+        # Запускаем пакетную обработку в отдельном потоке
+        threading.Thread(target=self.run_batch_inference, args=(tasks,), daemon=True).start()
+
+    def run_batch_inference(self, tasks):
+        # Обрабатываем снимки по очереди
+        for task in tasks:
+            path = task["path"]
+            lbl_res = task["lbl_res"]
+            lbl_verdict = task["lbl_verdict"]
+
+            # Обновляем UI: показываем, что именно этот снимок сейчас в работе
+            self.after(0, lambda lr=lbl_res, lv=lbl_verdict: self._set_analyzing_state(lr, lv))
+
+            try:
+                if path.lower().endswith(('.dcm', '.dicom')):
+                    image_array = load_dicom(path)
+                else:
+                    image_array = np.array(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
+
+                result = self.detector.predict(image_array, return_visualization=True)
+
+                gradcam_base64 = None
+                if self.use_gradcam_var.get() and self.gradcam is not None:
+                    image_size = self.detector.config.image_size
+                    image_resized = cv2.resize(image_array, (image_size, image_size))
+                    overlay = self.gradcam.visualize(image_resized)
+                    original_h, original_w = image_array.shape[:2]
+                    overlay = cv2.resize(overlay, (original_w, original_h))
+                    gradcam_base64 = encode_image_to_base64(overlay)
+
+                # Используем default arguments в lambda, чтобы зафиксировать значения переменных в цикле
+                self.after(0, lambda r=result, g=gradcam_base64, lr=lbl_res, lv=lbl_verdict:
+                self.update_row_success(r, g, lr, lv))
+
+            except Exception as e:
+                print(f"Error analyzing {path}: {e}")
+                self.after(0, lambda lr=lbl_res, lv=lbl_verdict:
+                self._set_error_state(lr, lv))
+
+    def _set_analyzing_state(self, lbl_res, lbl_verdict):
+        lbl_res.configure(image=self.empty_ctk_img, text="Анализ нейросетью...")
+        lbl_verdict.configure(text="В процессе...", text_color="white")
+
+    def _set_error_state(self, lbl_res, lbl_verdict):
+        lbl_res.configure(image=self.empty_ctk_img, text="Ошибка обработки")
+        lbl_verdict.configure(text="ОШИБКА", text_color=COLOR_ALERT)
+
+    def update_row_success(self, result, gradcam_base64, lbl_res, lbl_verdict):
         is_fracture = result.get("has_fracture", False)
         conf = result.get("confidence", 0.0) * 100
 
@@ -201,19 +230,21 @@ class XRayStandaloneApp(ctk.CTk):
             text = f"✅ ПАТОЛОГИЙ НЕ НАЙДЕНО ({conf:.1f}%)"
             color = COLOR_OK
 
-        self.lbl_verdict.configure(text=text, text_color=color)
+        lbl_verdict.configure(text=text, text_color=color)
 
         if img_b64_str:
             try:
                 img_bytes = base64.b64decode(img_b64_str)
                 pil_img = Image.open(io.BytesIO(img_bytes))
-                pil_img.thumbnail((450, 450))
+                # Чуть уменьшил размер до 400, чтобы удобнее скроллилось
+                pil_img.thumbnail((400, 400))
                 ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=pil_img.size)
-                self.current_res_img = ctk_img
-                self.img_label_res.configure(image=self.current_res_img, text="")
+
+                self.image_refs.append(ctk_img)  # Спасаем от сборщика мусора
+                lbl_res.configure(image=ctk_img, text="")
             except Exception as e:
                 print(f"Image display error: {e}")
-                self.img_label_res.configure(image=self.empty_ctk_img, text="Ошибка отображения")
+                lbl_res.configure(image=self.empty_ctk_img, text="Ошибка отображения")
 
     def display_image(self, path, label_widget):
         try:
@@ -224,15 +255,11 @@ class XRayStandaloneApp(ctk.CTk):
             else:
                 pil_img = Image.open(path)
 
-            pil_img.thumbnail((450, 450))
+            pil_img.thumbnail((400, 400))
             ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=pil_img.size)
-            if label_widget == self.img_label_orig:
-                self.current_orig_img = ctk_img
-                label_widget.configure(image=self.current_orig_img, text="")
-            else:
-                self.current_res_img = ctk_img
-                label_widget.configure(image=self.current_res_img, text="")
 
+            self.image_refs.append(ctk_img)
+            label_widget.configure(image=ctk_img, text="")
         except Exception as e:
             print(f"Display error: {e}")
             label_widget.configure(image=self.empty_ctk_img, text="Ошибка файла")
