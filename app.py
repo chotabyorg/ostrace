@@ -27,6 +27,10 @@ class XRayStandaloneApp(ctk.CTk):
         self.image_path = None
         self.detector = None
         self.gradcam = None
+
+        self.current_orig_img = None
+        self.current_res_img = None
+
         self._setup_ui()
 
     def _setup_ui(self):
@@ -147,7 +151,7 @@ class XRayStandaloneApp(ctk.CTk):
         self.image_path = path
 
         self.display_image(path, self.img_label_orig)
-        self.img_label_res.configure(image=None, text="Нейросеть анализирует...")
+        self.img_label_res.configure(image="", text="Нейросеть анализирует...")
         self.lbl_verdict.configure(text="Анализ...", text_color="white")
 
         threading.Thread(target=self.run_inference, daemon=True).start()
@@ -185,7 +189,6 @@ class XRayStandaloneApp(ctk.CTk):
         is_fracture = result.get("has_fracture", False)
         conf = result.get("confidence", 0.0) * 100
 
-        # Выбираем, что показывать: Grad-CAM (если просили и есть) или просто маску сегментации
         img_b64_str = gradcam_base64 if gradcam_base64 else result.get("processed_image")
 
         if is_fracture:
@@ -203,10 +206,11 @@ class XRayStandaloneApp(ctk.CTk):
                 pil_img = Image.open(io.BytesIO(img_bytes))
                 pil_img.thumbnail((450, 450))
                 ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=pil_img.size)
-                self.img_label_res.configure(image=ctk_img, text="")
+                self.current_res_img = ctk_img
+                self.img_label_res.configure(image=self.current_res_img, text="")
             except Exception as e:
                 print(f"Image display error: {e}")
-                self.img_label_res.configure(text="Ошибка отображения")
+                self.img_label_res.configure(image="", text="Ошибка отображения")
 
     def display_image(self, path, label_widget):
         try:
@@ -219,10 +223,16 @@ class XRayStandaloneApp(ctk.CTk):
 
             pil_img.thumbnail((450, 450))
             ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=pil_img.size)
-            label_widget.configure(image=ctk_img, text="")
+            if label_widget == self.img_label_orig:
+                self.current_orig_img = ctk_img
+                label_widget.configure(image=self.current_orig_img, text="")
+            else:
+                self.current_res_img = ctk_img
+                label_widget.configure(image=self.current_res_img, text="")
+
         except Exception as e:
             print(f"Display error: {e}")
-            label_widget.configure(text="Ошибка файла")
+            label_widget.configure(image="", text="Ошибка файла")
 
 
 if __name__ == "__main__":
