@@ -11,5 +11,4 @@ matplotlib>=3.5.0
 pydicom>=2.3.0
 
 customtkinter
-requests
 pyinstaller

@@ -13,6 +13,7 @@ import tensorflow as tf
 import keras
 from PIL import Image
 
+from .config import Config
 from .model import build_multitask_model, build_binary_classifier, SpatialAttention, ChannelAttention
 from .losses import combined_segmentation_loss, iou_metric, WarmupSchedule
 
