@@ -39,6 +39,19 @@ class XRayStandaloneApp(ctk.CTk):
 
     def _setup_ui(self):
         self.title(APP_TITLE)
+
+        try:
+            if sys.platform == "win32":
+                # На Windows берем иконку прямо из скомпилированного .exe файла
+                self.after(200, lambda: self.iconbitmap(sys.executable))
+            elif sys.platform == "darwin":
+                # На Mac иконка .app ставится сама, но для страховки (при запуске из PyCharm):
+                icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "OsTrace.icns")
+                if os.path.exists(icon_path):
+                    self.after(200, lambda: self.iconphoto(False, ctk.CTkImage(Image.open(icon_path))))
+        except Exception as e:
+            print(f"Не удалось загрузить иконку: {e}")
+
         self.geometry(WINDOW_SIZE)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
