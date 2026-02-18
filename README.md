@@ -129,7 +129,7 @@ curl http://localhost:8000/health
 
 ## Ссылка на гдрайв с моделью
 ```json
-
+https://drive.google.com/file/d/1GSldoPCfA2d9A4LTwyE3bUxxgIQ_3ocJ/view?usp=sharing
 ```
 ## Требования
 
@@ -141,4 +141,5 @@ curl http://localhost:8000/health
 - Pillow
 - pydantic 
 - pydicom
+
 
