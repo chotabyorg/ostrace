@@ -31,6 +31,9 @@ class XRayStandaloneApp(ctk.CTk):
         self.current_orig_img = None
         self.current_res_img = None
 
+        empty_pil = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        self.empty_ctk_img = ctk.CTkImage(light_image=empty_pil, dark_image=empty_pil, size=(1, 1))
+
         self._setup_ui()
 
     def _setup_ui(self):
@@ -151,7 +154,7 @@ class XRayStandaloneApp(ctk.CTk):
         self.image_path = path
 
         self.display_image(path, self.img_label_orig)
-        self.img_label_res.configure(image="", text="Нейросеть анализирует...")
+        self.img_label_res.configure(image=self.empty_ctk_img, text="Нейросеть анализирует...")
         self.lbl_verdict.configure(text="Анализ...", text_color="white")
 
         threading.Thread(target=self.run_inference, daemon=True).start()
@@ -210,7 +213,7 @@ class XRayStandaloneApp(ctk.CTk):
                 self.img_label_res.configure(image=self.current_res_img, text="")
             except Exception as e:
                 print(f"Image display error: {e}")
-                self.img_label_res.configure(image="", text="Ошибка отображения")
+                self.img_label_res.configure(image=self.empty_ctk_img, text="Ошибка отображения")
 
     def display_image(self, path, label_widget):
         try:
@@ -232,7 +235,7 @@ class XRayStandaloneApp(ctk.CTk):
 
         except Exception as e:
             print(f"Display error: {e}")
-            label_widget.configure(image="", text="Ошибка файла")
+            label_widget.configure(image=self.empty_ctk_img, text="Ошибка файла")
 
 
 if __name__ == "__main__":
