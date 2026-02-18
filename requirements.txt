@@ -9,3 +9,6 @@ python-multipart>=0.0.6
 pydantic>=1.10.0
 matplotlib>=3.5.0
 pydicom>=2.3.0
+
+customtkinter
+pyinstaller
