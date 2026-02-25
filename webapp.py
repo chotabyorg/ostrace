@@ -1,21 +1,18 @@
 import base64
 import logging
-import tempfile
+import os
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image
 
-from .model import SpatialAttention, ChannelAttention
-from .losses import combined_segmentation_loss, iou_metric, WarmupSchedule
-from .inference import FractureDetector, encode_image_to_base64, load_dicom
-from .gradcam import GradCAMVisualizer
+from .inference import OsTraceDetector
 
 try:
     import pydicom
@@ -28,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 webapp = FastAPI(
     title="OsTrace Web",
-    description="Web interface for fracture detection",
-    version="1.0.0",
+    description="On-prem fracture detection",
+    version="2.0.0",
 )
 
 webapp.add_middleware(
@@ -40,17 +37,64 @@ webapp.add_middleware(
     allow_headers=["*"],
 )
 
-detector: Optional[FractureDetector] = None
-gradcam_visualizer: Optional[GradCAMVisualizer] = None
-current_model_name: Optional[str] = None
+offline_detector: Optional[OsTraceDetector] = None
+
+
+def encode_image_to_base64(image: Union[np.ndarray, bytes]) -> str:
+    if isinstance(image, bytes):
+        return base64.b64encode(image).decode("utf-8")
+    if image.dtype != np.uint8:
+        image = (np.clip(image, 0, 1) * 255).astype(np.uint8)
+    if len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    elif image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+    _, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    return base64.b64encode(buffer.tobytes()).decode("utf-8")
+
+
+def load_dicom(dicom_path):
+    if not HAS_PYDICOM:
+        raise ImportError("pydicom required for DICOM support. Install: pip install pydicom")
+    import pydicom
+    if isinstance(dicom_path, bytes):
+        dicom_data = pydicom.dcmread(BytesIO(dicom_path))
+    else:
+        dicom_data = pydicom.dcmread(str(dicom_path))
+    pixel_array = dicom_data.pixel_array.astype(np.float32)
+    if hasattr(dicom_data, "WindowCenter") and hasattr(dicom_data, "WindowWidth"):
+        try:
+            center = float(dicom_data.WindowCenter[0] if isinstance(dicom_data.WindowCenter, list) else dicom_data.WindowCenter)
+            width = float(dicom_data.WindowWidth[0] if isinstance(dicom_data.WindowWidth, list) else dicom_data.WindowWidth)
+            min_val = center - width / 2
+            max_val = center + width / 2
+            pixel_array = np.clip(pixel_array, min_val, max_val)
+        except (ValueError, TypeError):
+            pass
+    pixel_min = pixel_array.min()
+    pixel_max = pixel_array.max()
+    if pixel_max > pixel_min:
+        pixel_array = (pixel_array - pixel_min) / (pixel_max - pixel_min)
+    else:
+        pixel_array = np.zeros_like(pixel_array)
+    if len(pixel_array.shape) == 2:
+        pixel_array = np.stack([pixel_array] * 3, axis=-1)
+    return pixel_array
 
 
 @webapp.on_event("startup")
 async def startup_event():
-    global detector, current_model_name
-    detector = None
-    current_model_name = None
-    logger.info("OsTrace Web started. Upload a model to begin.")
+    global offline_detector
+    if OsTraceDetector.is_available():
+        try:
+            offline_detector = OsTraceDetector()
+            logger.info("ONNX detector loaded successfully.")
+        except Exception as e:
+            logger.error(f"ONNX detector init failed: {e}")
+            offline_detector = None
+    else:
+        logger.warning("No ONNX model found. Place weights.onnx in exported_models_v5/")
+    logger.info("OsTrace Web started.")
 
 
 HTML_TEMPLATE = """
@@ -98,56 +142,26 @@ HTML_TEMPLATE = """
             font-size: 1.1rem;
         }
         
-        .model-section {
+        .status-bar {
             background: rgba(255, 255, 255, 0.05);
             border-radius: 20px;
-            padding: 20px 40px;
+            padding: 15px 30px;
             margin: 20px 0;
             display: flex;
             align-items: center;
             justify-content: center;
-            gap: 20px;
-            flex-wrap: wrap;
+            gap: 15px;
         }
-        
-        .model-section label {
-            color: #888;
-            font-size: 1rem;
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
         }
-        
-        .model-upload-btn {
-            background: linear-gradient(90deg, #28a745, #51cf66);
-            color: white;
-            border: none;
-            padding: 10px 25px;
-            font-size: 1rem;
-            border-radius: 20px;
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-        
-        .model-upload-btn:hover {
-            transform: scale(1.05);
-            box-shadow: 0 5px 20px rgba(40, 167, 69, 0.3);
-        }
-        
-        .current-model {
-            background: rgba(0, 212, 255, 0.1);
-            border: 1px solid #00d4ff;
-            border-radius: 8px;
-            padding: 5px 15px;
-            font-size: 0.9rem;
-            color: #00d4ff;
-        }
-        
-        .backbone-select {
-            background: rgba(255, 255, 255, 0.1);
-            color: #fff;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            padding: 8px 15px;
-            border-radius: 8px;
-            font-size: 0.9rem;
-        }
+
+        .status-dot.ok { background: #51cf66; }
+        .status-dot.error { background: #ff6b6b; }
         
         .upload-section {
             background: rgba(255, 255, 255, 0.05);
@@ -207,7 +221,7 @@ HTML_TEMPLATE = """
         }
         
         .analyze-btn {
-            background: #28a745;
+            background: linear-gradient(90deg, #7b2cbf, #9d4edd);
             color: white;
             border: none;
             padding: 15px 40px;
@@ -219,33 +233,15 @@ HTML_TEMPLATE = """
         }
         
         .analyze-btn:hover {
-            background: #218838;
             transform: scale(1.05);
+            box-shadow: 0 10px 30px rgba(123, 44, 191, 0.3);
         }
         
         .analyze-btn:disabled {
             background: #666;
             cursor: not-allowed;
             transform: none;
-        }
-        
-        .options {
-            margin: 20px 0;
-            display: flex;
-            justify-content: center;
-            gap: 20px;
-        }
-        
-        .option-label {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            cursor: pointer;
-        }
-        
-        .option-label input {
-            width: 18px;
-            height: 18px;
+            box-shadow: none;
         }
         
         .results-section {
@@ -262,6 +258,7 @@ HTML_TEMPLATE = """
             border-radius: 20px;
             padding: 30px;
             margin: 20px 0;
+            border-left: 4px solid #7b2cbf;
         }
         
         .result-header {
@@ -274,36 +271,7 @@ HTML_TEMPLATE = """
         .result-status {
             font-size: 1.5rem;
             font-weight: bold;
-        }
-        
-        .result-status.fracture {
-            color: #ff6b6b;
-        }
-        
-        .result-status.normal {
-            color: #51cf66;
-        }
-        
-        .confidence-bar {
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-            height: 20px;
-            overflow: hidden;
-            margin: 10px 0;
-        }
-        
-        .confidence-fill {
-            height: 100%;
-            border-radius: 10px;
-            transition: width 0.5s ease;
-        }
-        
-        .confidence-fill.high {
-            background: linear-gradient(90deg, #ff6b6b, #ff8787);
-        }
-        
-        .confidence-fill.low {
-            background: linear-gradient(90deg, #51cf66, #69db7c);
+            color: #9d4edd;
         }
         
         .images-grid {
@@ -321,7 +289,7 @@ HTML_TEMPLATE = """
         
         .image-card h3 {
             margin-bottom: 10px;
-            color: #00d4ff;
+            color: #9d4edd;
         }
         
         .image-card img {
@@ -383,16 +351,12 @@ HTML_TEMPLATE = """
     <div class="container">
         <header>
             <h1>OsTrace</h1>
-            <p class="subtitle">AI-Powered Fracture Detection & Localization</p>
+            <p class="subtitle">AI-Powered Fracture Detection &amp; Localization</p>
         </header>
         
-        <div class="model-section">
-            <label>Загрузить модель:</label>
-            <input type="file" id="modelFileInput" class="file-input" accept=".keras,.h5">
-            <button class="model-upload-btn" onclick="document.getElementById('modelFileInput').click()">
-                Выбрать файл модели
-            </button>
-            <span class="current-model" id="currentModelLabel">Модель не загружена</span>
+        <div class="status-bar">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText" style="color: #888; font-size: 0.95rem;">Проверка...</span>
         </div>
         
         <div class="upload-section" id="dropZone">
@@ -404,14 +368,9 @@ HTML_TEMPLATE = """
             
             <div class="preview-container" id="previewContainer">
                 <img id="previewImage" class="preview-image" alt="Preview">
-                <div class="options">
-                    <label class="option-label">
-                        <input type="checkbox" id="includeGradcam" checked>
-                        Show Grad-CAM visualization
-                    </label>
-                </div>
+                <br>
                 <button class="analyze-btn" id="analyzeBtn" onclick="analyzeImage()">
-                    Analyze Image
+                    🔬 Analyze
                 </button>
             </div>
         </div>
@@ -426,72 +385,38 @@ HTML_TEMPLATE = """
         <div class="results-section" id="resultsSection">
             <div class="result-card">
                 <div class="result-header">
-                    <span class="result-status" id="resultStatus"></span>
-                    <span id="confidenceText"></span>
+                    <span class="result-status">Detection Results</span>
+                    <span id="countBadge" style="background: linear-gradient(90deg, #7b2cbf, #9d4edd); padding: 5px 15px; border-radius: 20px; font-size: 0.9rem;"></span>
                 </div>
-                <div class="confidence-bar">
-                    <div class="confidence-fill" id="confidenceFill"></div>
+                <div style="margin: 15px 0;">
+                    <label style="color: #aaa; font-size: 0.9rem;">Confidence Threshold: <span id="thresholdValue">0.05</span></label>
+                    <input type="range" id="confidenceThreshold" min="0" max="100" value="5" style="width: 100%; accent-color: #9d4edd; margin-top: 5px;">
                 </div>
-            </div>
-            
-            <div class="images-grid" id="imagesGrid">
-                <div class="image-card" id="processedCard">
-                    <h3>Segmentation Overlay</h3>
-                    <img id="processedImage" alt="Processed">
-                </div>
-                <div class="image-card" id="gradcamCard">
-                    <h3>Grad-CAM Attention</h3>
-                    <img id="gradcamImage" alt="Grad-CAM">
+                <div style="margin: 15px 0;">
+                    <label style="color: #aaa; font-size: 0.9rem;">Heatmap Opacity: <span id="opacityValue">0.40</span></label>
+                    <input type="range" id="heatmapOpacity" min="0" max="100" value="40" style="width: 100%; accent-color: #ff6b6b; margin-top: 5px;">
                 </div>
             </div>
+            <div class="images-grid">
+                <div class="image-card" style="grid-column: 1 / -1;">
+                    <h3>Heatmap</h3>
+                    <canvas id="heatmapCanvas" style="width:100%; border-radius:10px;"></canvas>
+                </div>
+            </div>
+            <div id="predictionsList" style="margin-top: 15px;"></div>
         </div>
         
         <footer>
-            <p>OsTrace v1.0.0 - Multi-task Fracture Detection Model</p>
+            <p>OsTrace v2.0.0 — On-Prem Fracture Detection</p>
         </footer>
     </div>
     
     <script>
         let selectedFile = null;
         let isDicom = false;
-        let currentModel = null;
-        
-        document.getElementById('modelFileInput').addEventListener('change', function(e) {
-            uploadModel(e.target.files[0]);
-        });
-        
-        async function uploadModel(file) {
-            if (!file) return;
-            
-            const label = document.getElementById('currentModelLabel');
-            label.textContent = 'Загрузка...';
-            
-            const formData = new FormData();
-            formData.append('file', file);
-            
-            try {
-                const response = await fetch('/api/models/upload', {
-                    method: 'POST',
-                    body: formData
-                });
-                
-                if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(error.detail || 'Ошибка загрузки модели');
-                }
-                
-                const data = await response.json();
-                currentModel = data.current_model;
-                label.textContent = 'Модель: ' + currentModel;
-                console.log('Модель загружена:', data);
-            } catch (error) {
-                console.error('Ошибка загрузки модели:', error);
-                label.textContent = 'Ошибка: ' + error.message;
-                setTimeout(() => {
-                    label.textContent = currentModel ? 'Модель: ' + currentModel : 'Модель не загружена';
-                }, 2000);
-            }
-        }
+        let lastPredictions = [];
+        let originalImage = null; // Image object for the original
+        let imgW = 0, imgH = 0;
         
         document.getElementById('fileInput').addEventListener('change', function(e) {
             handleFile(e.target.files[0]);
@@ -516,36 +441,26 @@ HTML_TEMPLATE = """
         });
         
         function handleFile(file) {
-            if (!file) {
-                showError('Please select a file');
-                return;
-            }
-            
+            if (!file) { showError('Please select a file'); return; }
             const fileName = file.name.toLowerCase();
             isDicom = fileName.endsWith('.dcm') || fileName.endsWith('.dicom');
-            
             if (!isDicom && !file.type.startsWith('image/')) {
                 showError('Please select a valid image file or DICOM file');
                 return;
             }
-            
             selectedFile = file;
-            
             if (isDicom) {
                 document.getElementById('previewImage').src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzAwIiBoZWlnaHQ9IjIwMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSIjMjIyIi8+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGZpbGw9IiM4ODgiIGZvbnQtZmFtaWx5PSJzYW5zLXNlcmlmIiBmb250LXNpemU9IjE0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBkeT0iLjNlbSI+RElDT00gRmlsZTwvdGV4dD48L3N2Zz4=';
-                document.getElementById('previewContainer').classList.add('active');
-                document.getElementById('resultsSection').classList.remove('active');
-                document.getElementById('errorMessage').classList.remove('active');
             } else {
                 const reader = new FileReader();
                 reader.onload = function(e) {
                     document.getElementById('previewImage').src = e.target.result;
-                    document.getElementById('previewContainer').classList.add('active');
-                    document.getElementById('resultsSection').classList.remove('active');
-                    document.getElementById('errorMessage').classList.remove('active');
                 };
                 reader.readAsDataURL(file);
             }
+            document.getElementById('previewContainer').classList.add('active');
+            document.getElementById('resultsSection').classList.remove('active');
+            document.getElementById('errorMessage').classList.remove('active');
         }
         
         function showError(message) {
@@ -554,41 +469,134 @@ HTML_TEMPLATE = """
             errorDiv.classList.add('active');
         }
         
+        // JET colormap lookup (simplified 256 entries)
+        function jetColor(t) {
+            // t in [0,1], returns [r, g, b]
+            let r, g, b;
+            if (t < 0.125) { r = 0; g = 0; b = 0.5 + t * 4; }
+            else if (t < 0.375) { r = 0; g = (t - 0.125) * 4; b = 1; }
+            else if (t < 0.625) { r = (t - 0.375) * 4; g = 1; b = 1 - (t - 0.375) * 4; }
+            else if (t < 0.875) { r = 1; g = 1 - (t - 0.625) * 4; b = 0; }
+            else { r = 1 - (t - 0.875) * 4; g = 0; b = 0; }
+            return [Math.round(Math.max(0, Math.min(1, r)) * 255),
+                    Math.round(Math.max(0, Math.min(1, g)) * 255),
+                    Math.round(Math.max(0, Math.min(1, b)) * 255)];
+        }
+        
+        function renderHeatmap() {
+            if (!originalImage) return;
+            const canvas = document.getElementById('heatmapCanvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = imgW;
+            canvas.height = imgH;
+            
+            const threshold = document.getElementById('confidenceThreshold').value / 100;
+            const opacity = document.getElementById('heatmapOpacity').value / 100;
+            
+            // Draw original image
+            ctx.drawImage(originalImage, 0, 0, imgW, imgH);
+            
+            // Filter predictions by threshold
+            const filtered = lastPredictions.filter(p => (p.confidence || 0) >= threshold);
+            
+            // Update badge
+            const badge = document.getElementById('countBadge');
+            badge.textContent = filtered.length > 0 ? filtered.length + ' fracture(s) detected' : 'No fractures detected';
+            
+            if (filtered.length === 0 || opacity === 0) {
+                renderPredictions(lastPredictions, threshold);
+                return;
+            }
+            
+            // Generate heatmap on offscreen canvas
+            const heatCanvas = document.createElement('canvas');
+            heatCanvas.width = imgW;
+            heatCanvas.height = imgH;
+            const hCtx = heatCanvas.getContext('2d');
+            
+            // Build heatmap array
+            const heatData = new Float32Array(imgW * imgH);
+            
+            for (const p of filtered) {
+                const cx = p.x || 0;
+                const cy = p.y || 0;
+                const bw = p.width || 0;
+                const bh = p.height || 0;
+                const conf = p.confidence || 0;
+                const sigX = Math.max(bw * 0.6, 20);
+                const sigY = Math.max(bh * 0.6, 20);
+                
+                // Only compute within 3 sigma
+                const x1 = Math.max(0, Math.floor(cx - sigX * 3));
+                const x2 = Math.min(imgW, Math.ceil(cx + sigX * 3));
+                const y1 = Math.max(0, Math.floor(cy - sigY * 3));
+                const y2 = Math.min(imgH, Math.ceil(cy + sigY * 3));
+                
+                for (let y = y1; y < y2; y++) {
+                    for (let x = x1; x < x2; x++) {
+                        const dx = (x - cx) / sigX;
+                        const dy = (y - cy) / sigY;
+                        const g = Math.exp(-0.5 * (dx * dx + dy * dy)) * conf;
+                        const idx = y * imgW + x;
+                        heatData[idx] += g;
+                    }
+                }
+            }
+            
+            // Normalize
+            let maxVal = 0;
+            for (let i = 0; i < heatData.length; i++) {
+                if (heatData[i] > maxVal) maxVal = heatData[i];
+            }
+            
+            // Draw heatmap with JET colormap
+            const imgData = hCtx.createImageData(imgW, imgH);
+            for (let i = 0; i < heatData.length; i++) {
+                const t = maxVal > 0 ? heatData[i] / maxVal : 0;
+                const [r, g, b] = jetColor(t);
+                imgData.data[i * 4] = r;
+                imgData.data[i * 4 + 1] = g;
+                imgData.data[i * 4 + 2] = b;
+                imgData.data[i * 4 + 3] = 255;
+            }
+            hCtx.putImageData(imgData, 0, 0);
+            
+            // Blend heatmap over original
+            ctx.globalAlpha = opacity;
+            ctx.drawImage(heatCanvas, 0, 0);
+            ctx.globalAlpha = 1.0;
+            
+            renderPredictions(lastPredictions, threshold);
+        }
+        
+        document.getElementById('confidenceThreshold').addEventListener('input', function(e) {
+            const val = (e.target.value / 100).toFixed(2);
+            document.getElementById('thresholdValue').textContent = val;
+            renderHeatmap();
+        });
+        
+        document.getElementById('heatmapOpacity').addEventListener('input', function(e) {
+            const val = (e.target.value / 100).toFixed(2);
+            document.getElementById('opacityValue').textContent = val;
+            renderHeatmap();
+        });
+        
         async function analyzeImage() {
-            if (!selectedFile) {
-                showError('Please select an image first');
-                return;
-            }
+            if (!selectedFile) { showError('Please select an image first'); return; }
             
-            if (!currentModel) {
-                showError('Please upload a model first');
-                return;
-            }
-            
-            const analyzeBtn = document.getElementById('analyzeBtn');
+            const btn = document.getElementById('analyzeBtn');
             const loading = document.getElementById('loading');
-            const resultsSection = document.getElementById('resultsSection');
+            const results = document.getElementById('resultsSection');
             const errorMessage = document.getElementById('errorMessage');
             
-            analyzeBtn.disabled = true;
+            btn.disabled = true;
             loading.classList.add('active');
-            resultsSection.classList.remove('active');
+            results.classList.remove('active');
             errorMessage.classList.remove('active');
             
             try {
-                const base64 = await new Promise((resolve, reject) => {
-                    const reader = new FileReader();
-                    reader.onload = () => resolve(reader.result.split(',')[1]);
-                    reader.onerror = reject;
-                    reader.readAsDataURL(selectedFile);
-                });
-                
-                const includeGradcam = document.getElementById('includeGradcam').checked;
-                
                 const formData = new FormData();
-                formData.append('image', base64);
-                formData.append('include_gradcam', includeGradcam);
-                formData.append('is_dicom', isDicom);
+                formData.append('file', selectedFile);
                 
                 const response = await fetch('/api/predict', {
                     method: 'POST',
@@ -597,58 +605,79 @@ HTML_TEMPLATE = """
                 
                 if (!response.ok) {
                     const errorData = await response.json();
-                    throw new Error(errorData.error || `Server error: ${response.statusText}`);
+                    throw new Error(errorData.error || errorData.detail || 'Server error');
                 }
                 
                 const result = await response.json();
-                displayResults(result, includeGradcam);
+                
+                // Load original image
+                const img = new Image();
+                img.onload = function() {
+                    originalImage = img;
+                    imgW = img.width;
+                    imgH = img.height;
+                    lastPredictions = result.predictions || [];
+                    renderHeatmap();
+                    results.classList.add('active');
+                };
+                let src = result.original_image || '';
+                if (src && !src.startsWith('data:')) {
+                    src = 'data:image/jpeg;base64,' + src;
+                }
+                img.src = src;
                 
             } catch (error) {
-                showError(`Analysis failed: ${error.message}`);
+                showError('Analysis failed: ' + error.message);
             } finally {
-                analyzeBtn.disabled = false;
+                btn.disabled = false;
                 loading.classList.remove('active');
             }
         }
         
-        function displayResults(result, includeGradcam) {
-            const resultsSection = document.getElementById('resultsSection');
-            const resultStatus = document.getElementById('resultStatus');
-            const confidenceText = document.getElementById('confidenceText');
-            const confidenceFill = document.getElementById('confidenceFill');
-            const processedImage = document.getElementById('processedImage');
-            const gradcamImage = document.getElementById('gradcamImage');
-            const gradcamCard = document.getElementById('gradcamCard');
+        function renderPredictions(preds, threshold) {
+            const container = document.getElementById('predictionsList');
+            const filtered = preds.filter(p => (p.confidence || 0) >= threshold);
             
-            if (result.has_fracture) {
-                resultStatus.textContent = 'Fracture Detected';
-                resultStatus.className = 'result-status fracture';
-            } else {
-                resultStatus.textContent = 'No Fracture Detected';
-                resultStatus.className = 'result-status normal';
+            if (filtered.length === 0) {
+                container.innerHTML = '<div style="background:rgba(255,255,255,0.05); border-radius:12px; padding:15px; text-align:center; color:#888;">No predictions above threshold (' + threshold.toFixed(2) + ')</div>';
+                return;
             }
             
-            const confidencePercent = (result.confidence * 100).toFixed(1);
-            confidenceText.textContent = `Confidence: ${confidencePercent}%`;
-            
-            confidenceFill.style.width = `${confidencePercent}%`;
-            if (result.has_fracture) {
-                confidenceFill.className = 'confidence-fill high';
-            } else {
-                confidenceFill.className = 'confidence-fill low';
-            }
-            
-            processedImage.src = `data:image/jpeg;base64,${result.processed_image}`;
-            
-            if (includeGradcam && result.gradcam_image) {
-                gradcamImage.src = `data:image/jpeg;base64,${result.gradcam_image}`;
-                gradcamCard.style.display = 'block';
-            } else {
-                gradcamCard.style.display = 'none';
-            }
-            
-            resultsSection.classList.add('active');
+            let html = '';
+            filtered.forEach((p, i) => {
+                const conf = ((p.confidence || 0) * 100).toFixed(1);
+                const cls = p.class || 'fracture';
+                const color = p.confidence >= 0.7 ? '#ff6b6b' : (p.confidence >= 0.4 ? '#ffa94d' : '#868e96');
+                html += '<div style="background:rgba(255,255,255,0.05); border-radius:12px; padding:12px 18px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; border-left:3px solid ' + color + ';">';
+                html += '<span style="color:#ddd;">#' + (i+1) + ' <strong>' + cls + '</strong></span>';
+                html += '<span style="color:' + color + '; font-weight:bold;">' + conf + '%</span>';
+                html += '</div>';
+            });
+            container.innerHTML = html;
         }
+        
+        async function checkHealth() {
+            try {
+                const resp = await fetch('/health');
+                const data = await resp.json();
+                const dot = document.getElementById('statusDot');
+                const text = document.getElementById('statusText');
+                if (data.detector_ready) {
+                    dot.className = 'status-dot ok';
+                    text.textContent = 'ONNX модель загружена — готово к анализу';
+                    text.style.color = '#51cf66';
+                } else {
+                    dot.className = 'status-dot error';
+                    text.textContent = 'Модель не найдена';
+                    text.style.color = '#ff6b6b';
+                    document.getElementById('analyzeBtn').disabled = true;
+                }
+            } catch(e) {
+                document.getElementById('statusText').textContent = 'Ошибка подключения';
+            }
+        }
+        
+        checkHealth();
     </script>
 </body>
 </html>
@@ -660,174 +689,106 @@ async def root():
     return HTML_TEMPLATE
 
 
+@webapp.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "detector_ready": offline_detector is not None,
+        "dicom_support": HAS_PYDICOM,
+    }
+
+
+def generate_heatmap_from_bboxes(
+    image: np.ndarray,
+    predictions: list,
+    threshold: float = 0.25,
+) -> np.ndarray:
+    h, w = image.shape[:2]
+    heatmap = np.zeros((h, w), dtype=np.float32)
+
+    for pred in predictions:
+        conf = pred.get("confidence", 0)
+        if conf < threshold:
+            continue
+
+        cx = pred.get("x", 0)
+        cy = pred.get("y", 0)
+        bw = pred.get("width", 0)
+        bh = pred.get("height", 0)
+
+        sigma_x = max(bw * 0.6, 20)
+        sigma_y = max(bh * 0.6, 20)
+
+        y_coords, x_coords = np.mgrid[0:h, 0:w]
+        gaussian = np.exp(
+            -((x_coords - cx) ** 2 / (2 * sigma_x ** 2)
+              + (y_coords - cy) ** 2 / (2 * sigma_y ** 2))
+        )
+        heatmap += gaussian * conf
+
+    if heatmap.max() > 0:
+        heatmap = heatmap / heatmap.max()
+
+    heatmap_uint8 = (heatmap * 255).astype(np.uint8)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+    if image.max() <= 1.0:
+        vis_image = (image * 255).astype(np.uint8)
+    else:
+        vis_image = image.astype(np.uint8)
+
+    if len(vis_image.shape) == 2:
+        vis_image = cv2.cvtColor(vis_image, cv2.COLOR_GRAY2BGR)
+    elif vis_image.shape[2] == 3:
+        vis_image = cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR)
+
+    alpha = 0.4
+    overlay = cv2.addWeighted(vis_image, 1 - alpha, heatmap_color, alpha, 0)
+    return overlay
+
+
 @webapp.post("/api/predict")
-async def api_predict(
-    image: str = Form(...),
-    include_gradcam: bool = Form(True),
-    is_dicom: bool = Form(False)
-):
-    if detector is None or detector.model is None:
-        return JSONResponse({"error": "No model loaded. Please upload a model first."}, status_code=503)
-    
-    try:
-        image_data = base64.b64decode(image)
-        
-        if is_dicom:
-            if not HAS_PYDICOM:
-                return JSONResponse(
-                    {"error": "DICOM support not available. Install pydicom: pip install pydicom"},
-                    status_code=400
-                )
-            image_array = load_dicom(image_data)
-        else:
-            image_array = np.array(
-                Image.open(BytesIO(image_data)).convert("RGB"),
-                dtype=np.float32
-            ) / 255.0
-        
-        result = detector.predict(image_array, return_visualization=True)
-        
-        gradcam_base64 = None
-        if include_gradcam and gradcam_visualizer is not None:
-            try:
-                image_size = detector.config.image_size
-                image_resized = cv2.resize(image_array, (image_size, image_size))
-                if image_resized.max() > 1.0:
-                    image_resized = image_resized / 255.0
-                
-                if image_resized is not None and image_resized.size > 0:
-                    overlay = gradcam_visualizer.visualize(image_resized)
-                    original_h, original_w = image_array.shape[:2]
-                    overlay = cv2.resize(overlay, (original_w, original_h))
-                    gradcam_base64 = encode_image_to_base64(overlay)
-            except Exception as e:
-                logger.error(f"Grad-CAM generation failed: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-        
-        return {
-            "has_fracture": result["has_fracture"],
-            "confidence": result["confidence"],
-            "processed_image": result["processed_image"],
-            "gradcam_image": gradcam_base64,
-        }
-        
-    except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
-        return JSONResponse({"error": str(e)}, status_code=400)
+async def api_predict(file: UploadFile = File(...)):
+    if offline_detector is None:
+        return JSONResponse(
+            {"error": "ONNX model not loaded. Place weights.onnx in exported_models_v5/"},
+            status_code=503,
+        )
 
-
-@webapp.post("/api/upload")
-async def api_upload(
-    file: UploadFile = File(...),
-    include_gradcam: bool = Form(True)
-):
-    if detector is None or detector.model is None:
-        return JSONResponse({"error": "No model loaded. Please upload a model first."}, status_code=503)
-    
     try:
         image_bytes = await file.read()
         filename = file.filename.lower() if file.filename else ""
-        is_dicom = filename.endswith('.dcm') or filename.endswith('.dicom')
-        
-        if is_dicom:
+        is_dicom_file = filename.endswith('.dcm') or filename.endswith('.dicom')
+
+        if is_dicom_file:
             if not HAS_PYDICOM:
                 return JSONResponse(
                     {"error": "DICOM support not available. Install pydicom: pip install pydicom"},
-                    status_code=400
+                    status_code=400,
                 )
             image_array = load_dicom(image_bytes)
         else:
             image_array = np.array(
                 Image.open(BytesIO(image_bytes)).convert("RGB"),
-                dtype=np.float32
+                dtype=np.float32,
             ) / 255.0
-        
-        result = detector.predict(image_array, return_visualization=True)
-        
-        gradcam_base64 = None
-        if include_gradcam and gradcam_visualizer is not None:
-            try:
-                image_size = detector.config.image_size
-                image_resized = cv2.resize(image_array, (image_size, image_size))
-                overlay = gradcam_visualizer.visualize(image_resized)
-                original_h, original_w = image_array.shape[:2]
-                overlay = cv2.resize(overlay, (original_w, original_h))
-                gradcam_base64 = encode_image_to_base64(overlay)
-            except Exception as e:
-                logger.error(f"Grad-CAM generation failed: {e}")
-        
+
+        result = offline_detector.predict(image_array)
+        preds = result.get("predictions", [])
+        count = result.get("count_objects", 0)
+
+        original_base64 = encode_image_to_base64(image_array)
+
         return {
-            "has_fracture": result["has_fracture"],
-            "confidence": result["confidence"],
-            "processed_image": result["processed_image"],
-            "gradcam_image": gradcam_base64,
+            "count_objects": count,
+            "predictions": preds,
+            "original_image": original_base64,
         }
-        
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
+        logger.error(f"Prediction error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return JSONResponse({"error": str(e)}, status_code=400)
-
-
-@webapp.get("/health")
-async def health():
-    return {
-        "status": "healthy",
-        "model_loaded": detector is not None and detector.model is not None,
-        "gradcam_available": gradcam_visualizer is not None,
-        "dicom_support": HAS_PYDICOM,
-        "current_model": current_model_name,
-    }
-
-
-@webapp.post("/api/models/upload")
-async def api_upload_model(file: UploadFile = File(...)):
-    global detector, gradcam_visualizer, current_model_name
-    
-    try:
-        model_bytes = await file.read()
-        model_filename = file.filename or "uploaded_model.keras"
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(model_filename).suffix) as tmp:
-            tmp.write(model_bytes)
-            temp_path = tmp.name
-        
-        if detector is None:
-            config = Config()
-            detector = FractureDetector(config)
-        
-        detector.load_model_from_file(temp_path)
-        current_model_name = model_filename
-        
-        try:
-            gradcam_visualizer = GradCAMVisualizer(detector.model)
-            logger.info(f"GradCAMVisualizer инициализирован для загруженной модели")
-        except Exception as e:
-            logger.warning(f"Не удалось инициализировать GradCAMVisualizer: {e}")
-            gradcam_visualizer = None
-        
-        return {
-            "status": "success",
-            "current_model": current_model_name,
-            "config": detector.config.to_dict(),
-        }
-    except Exception as e:
-        error_type = type(e).__name__
-        error_msg = str(e)
-        
-        if len(error_msg) > 500:
-            error_msg = error_msg[:500] + "... [обрезано]"
-        
-        logger.error(f"Ошибка загрузки модели: {error_type}: {error_msg}")
-        
-        with open("error.log", "w", encoding="utf-8") as f:
-            import traceback
-            f.write(f"Тип ошибки: {error_type}\n")
-            f.write(f"Сообщение (первые 2000 символов): {str(e)[:2000]}\n\n")
-            f.write("Traceback:\n")
-            f.write(traceback.format_exc())
-        
-        return JSONResponse({"detail": f"{error_type}: {error_msg}"}, status_code=400)
 
 
 if __name__ == "__main__":
