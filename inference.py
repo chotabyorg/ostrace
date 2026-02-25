@@ -15,7 +15,7 @@ try:
 except ImportError:
     HAS_ORT = False
 
-EXPORTED_MODELS_DIR = Path(__file__).parent / "exported_models_v5"
+EXPORTED_MODELS_DIR = Path(__file__).parent / "ostracemodel"
 
 
 class OsTraceDetector:
@@ -200,3 +200,4 @@ class OsTraceDetector:
     def is_available(model_dir: Optional[str] = None) -> bool:
         d = Path(model_dir) if model_dir else EXPORTED_MODELS_DIR
         return HAS_ORT and any(d.glob("*.onnx")) if d.exists() else False
+
