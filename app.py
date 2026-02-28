@@ -9,8 +9,14 @@ import cv2
 import os
 import sys
 
-from .gradcam import GradCAMVisualizer
-from .inference import FractureDetector, Config, encode_image_to_base64, load_dicom
+from inference import OsTraceDetector
+
+try:
+    import pydicom
+
+    HAS_PYDICOM = True
+except ImportError:
+    HAS_PYDICOM = False
 
 APP_TITLE = "OsTrace: Standalone AI Client"
 WINDOW_SIZE = "1150x750"
@@ -23,12 +29,77 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
+def encode_image_to_base64(image: np.ndarray) -> str:
+    if image.dtype != np.uint8:
+        image = (np.clip(image, 0, 1) * 255).astype(np.uint8)
+    if len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    elif image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+    _, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    return base64.b64encode(buffer.tobytes()).decode("utf-8")
+
+
+def load_dicom(data):
+    if not HAS_PYDICOM:
+        raise ImportError("pydicom не установлен. Выполните: pip install pydicom")
+    ds = pydicom.dcmread(io.BytesIO(data) if isinstance(data, bytes) else str(data))
+    px = ds.pixel_array.astype(np.float32)
+    if hasattr(ds, "WindowCenter") and hasattr(ds, "WindowWidth"):
+        try:
+            c = float(ds.WindowCenter[0] if isinstance(ds.WindowCenter, list) else ds.WindowCenter)
+            w = float(ds.WindowWidth[0] if isinstance(ds.WindowWidth, list) else ds.WindowWidth)
+            px = np.clip(px, c - w / 2, c + w / 2)
+        except (ValueError, TypeError):
+            pass
+    mn, mx = px.min(), px.max()
+    px = (px - mn) / (mx - mn) if mx > mn else np.zeros_like(px)
+    if len(px.shape) == 2:
+        px = np.stack([px] * 3, axis=-1)
+    return px
+
+
+def generate_heatmap_overlay(image: np.ndarray, predictions: list, alpha: float = 0.4) -> np.ndarray:
+    h, w = image.shape[:2]
+    heatmap = np.zeros((h, w), dtype=np.float32)
+
+    for pred in predictions:
+        cx, cy = pred["x"], pred["y"]
+        bw, bh = pred["width"], pred["height"]
+        conf = pred["confidence"]
+        sx = max(bw * 0.6, 20)
+        sy = max(bh * 0.6, 20)
+
+        y_coords, x_coords = np.mgrid[0:h, 0:w]
+        gaussian = np.exp(
+            -((x_coords - cx) ** 2 / (2 * sx ** 2)
+              + (y_coords - cy) ** 2 / (2 * sy ** 2))
+        )
+        heatmap += gaussian * conf
+
+    if heatmap.max() > 0:
+        heatmap /= heatmap.max()
+
+    heatmap_color = cv2.applyColorMap((heatmap * 255).astype(np.uint8), cv2.COLORMAP_JET)
+
+    if image.max() <= 1.0:
+        vis = (image * 255).astype(np.uint8)
+    else:
+        vis = image.astype(np.uint8)
+
+    if len(vis.shape) == 2:
+        vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+    elif vis.shape[2] == 3:
+        vis = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+
+    return cv2.addWeighted(vis, 1 - alpha, heatmap_color, alpha, 0)
+
+
+# --- Основной класс приложения ---
 class XRayStandaloneApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.detector = None
-        self.gradcam = None
-
         self.image_refs = []
 
         empty_pil = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
@@ -42,10 +113,8 @@ class XRayStandaloneApp(ctk.CTk):
 
         try:
             if sys.platform == "win32":
-                # На Windows берем иконку прямо из скомпилированного .exe файла
                 self.after(200, lambda: self.iconbitmap(sys.executable))
             elif sys.platform == "darwin":
-                # На Mac иконка .app ставится сама, но для страховки (при запуске из PyCharm):
                 icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "OsTrace.icns")
                 if os.path.exists(icon_path):
                     self.after(200, lambda: self.iconphoto(False, ctk.CTkImage(Image.open(icon_path))))
@@ -63,24 +132,21 @@ class XRayStandaloneApp(ctk.CTk):
         ctk.CTkLabel(self.sidebar, text="OSTRACE\nAI ENGINE",
                      font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(30, 20))
 
-        # Кнопка загрузки модели
+        # Кнопка загрузки модели (теперь ждет папку или ONNX)
         self.btn_load_model = ctk.CTkButton(self.sidebar, text="🧠 Загрузить модель",
                                             command=self.load_model, fg_color="#7b2cbf", hover_color="#5a189a")
         self.btn_load_model.pack(padx=20, pady=(0, 20))
 
-        # Разделитель
         ctk.CTkFrame(self.sidebar, height=2, fg_color="gray30").pack(fill="x", padx=20, pady=10)
 
-        # Кнопка загрузки снимков
         self.btn_load_img = ctk.CTkButton(self.sidebar, text="📂 Загрузить снимки",
                                           command=self.load_images, state="disabled")
         self.btn_load_img.pack(padx=20, pady=10)
 
-        # Чекбокс для Grad-CAM (Тепловая карта)
-        self.use_gradcam_var = ctk.BooleanVar(value=True)
-        self.cb_gradcam = ctk.CTkCheckBox(self.sidebar, text="Показывать Grad-CAM",
-                                          variable=self.use_gradcam_var, state="disabled")
-        self.cb_gradcam.pack(padx=20, pady=10)
+        self.use_heatmap_var = ctk.BooleanVar(value=True)
+        self.cb_heatmap = ctk.CTkCheckBox(self.sidebar, text="Показывать тепловую карту",
+                                          variable=self.use_heatmap_var, state="disabled")
+        self.cb_heatmap.pack(padx=20, pady=10)
 
         self.status_label = ctk.CTkLabel(self.sidebar, text="Ожидание модели...", text_color="gray")
         self.status_label.pack(side="bottom", pady=20)
@@ -90,64 +156,44 @@ class XRayStandaloneApp(ctk.CTk):
         self.scroll_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
 
     def load_model(self):
-        path = filedialog.askopenfilename(filetypes=[("Keras Model", "*.keras *.h5")])
+        # Теперь ищем .onnx файлы
+        path = filedialog.askopenfilename(filetypes=[("ONNX Model", "*.onnx")])
         if not path: return
 
         self.btn_load_model.configure(state="disabled")
-        self.status_label.configure(text="Инициализация ML-движка...\n(может занять 10-15 сек)", text_color=COLOR_WARN)
+        self.status_label.configure(text="Инициализация ONNX...\n(может занять время)", text_color=COLOR_WARN)
 
-        # Загружаем тяжелую модель в фоне, чтобы не вешать UI
-        threading.Thread(target=self._init_model_backend, args=(path,), daemon=True).start()
+        # Новый детектор принимает директорию, в которой лежит .onnx
+        model_dir = os.path.dirname(path)
+        threading.Thread(target=self._init_model_backend, args=(model_dir,), daemon=True).start()
 
     def _auto_load_model(self):
-        # 1. Определяем, где лежит наша программа
         if getattr(sys, 'frozen', False):
             if sys.platform == "darwin" and "MacOS" in sys.executable:
-                # Если это Mac .app файл: спускаемся на 4 уровня вверх из папки Contents/MacOS/
                 base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(sys.executable))))
             else:
                 base_dir = os.path.dirname(sys.executable)
         else:
-            # Если запускаем из PyCharm
             base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-        # 2. Ищем папку models рядом с программой
-        models_dir = os.path.join(base_dir, "models")
+        # Ищем папку ostracemodel (новое дефолтное место) или models
+        for target_dir in ["ostracemodel", "models"]:
+            models_dir = os.path.join(base_dir, target_dir)
+            if os.path.exists(models_dir):
+                for file in os.listdir(models_dir):
+                    if file.endswith(".onnx"):
+                        print(f"Найдена модель по умолчанию: {models_dir}")
+                        self.btn_load_model.configure(state="disabled")
+                        self.status_label.configure(text="Авто-загрузка ONNX...", text_color=COLOR_WARN)
+                        threading.Thread(target=self._init_model_backend, args=(models_dir,), daemon=True).start()
+                        return
 
-        if os.path.exists(models_dir):
-            for file in os.listdir(models_dir):
-                if file.endswith((".keras", ".h5")):
-                    model_path = os.path.join(models_dir, file)
-                    print(f"Найдена модель по умолчанию: {model_path}")
+        print("Папка с .onnx моделью не найдена. Ждем ручной загрузки.")
 
-                    self.btn_load_model.configure(state="disabled")
-                    self.status_label.configure(text="Авто-загрузка модели...\n(может занять 10-15 сек)",
-                                                text_color=COLOR_WARN)
-
-                    threading.Thread(target=self._init_model_backend, args=(model_path,), daemon=True).start()
-                    return
-
-        print("Папка models не найдена или пуста. Ждем ручной загрузки.")
-
-    def _init_model_backend(self, model_path):
+    def _init_model_backend(self, model_dir):
         try:
-            # Инициализация детекторов из кода ML-инженеров
-            config = Config()
-            self.detector = FractureDetector(config=config, model_path=model_path)
-
-            # Автоматически обновляем размер картинки под требования загруженной модели
-            if self.detector.model is not None and self.detector.model.input_shape:
-                expected_size = self.detector.model.input_shape[1]
-                if expected_size:
-                    self.detector.config.image_size = expected_size
-                    print(f"Размер в конфиге автоматически изменен на {expected_size}")
-
-            try:
-                self.gradcam = GradCAMVisualizer(self.detector.model)
-            except Exception as e:
-                print(f"GradCAM init warning: {e}")
-                self.gradcam = None
-
+            # Инициализация нового детектора
+            self.detector = OsTraceDetector(model_dir=model_dir)
             self.after(0, self._on_model_loaded_success)
         except Exception as e:
             err_msg = str(e)
@@ -157,11 +203,10 @@ class XRayStandaloneApp(ctk.CTk):
         self.status_label.configure(text="Модель активна! ✅", text_color=COLOR_OK)
         self.btn_load_model.configure(text="Сменить модель", fg_color="gray30", state="normal")
         self.btn_load_img.configure(state="normal")
-        if self.gradcam:
-            self.cb_gradcam.configure(state="normal")
+        self.cb_heatmap.configure(state="normal")
 
     def _on_model_loaded_error(self, err_msg):
-        self.status_label.configure(text="Ошибка загрузки модели ❌", text_color=COLOR_ALERT)
+        self.status_label.configure(text="Ошибка загрузки ❌", text_color=COLOR_ALERT)
         self.btn_load_model.configure(state="normal")
         messagebox.showerror("ML Engine Error", f"Не удалось загрузить модель:\n{err_msg}")
 
@@ -173,24 +218,20 @@ class XRayStandaloneApp(ctk.CTk):
         paths = filedialog.askopenfilenames(filetypes=[("Images", "*.jpg *.png *.jpeg *.dcm")])
         if not paths: return
 
-        # Очищаем ленту от предыдущих результатов
         for widget in self.scroll_frame.winfo_children():
             widget.destroy()
         self.image_refs.clear()
 
         tasks = []
 
-        # Динамически создаем UI-карточку для каждого снимка
         for i, path in enumerate(paths):
             row_frame = ctk.CTkFrame(self.scroll_frame, corner_radius=10)
             row_frame.pack(fill="x", pady=15, padx=10)
 
-            # Заголовок карточки с именем файла
-            filename = path.split("/")[-1]
+            filename = os.path.basename(path)
             title = ctk.CTkLabel(row_frame, text=f"Снимок {i + 1}: {filename}", font=("Arial", 16, "bold"))
             title.pack(pady=(10, 5))
 
-            # Контейнер для двух картинок
             imgs_frame = ctk.CTkFrame(row_frame, fg_color="transparent")
             imgs_frame.pack(fill="x", pady=5)
             imgs_frame.columnconfigure(0, weight=1)
@@ -202,31 +243,25 @@ class XRayStandaloneApp(ctk.CTk):
             lbl_res = ctk.CTkLabel(imgs_frame, text="Ожидание очереди...", font=("Arial", 12))
             lbl_res.grid(row=0, column=1, padx=10, pady=5)
 
-            # Вердикт внизу карточки
             lbl_verdict = ctk.CTkLabel(row_frame, text="Ожидание...", font=("Arial", 20, "bold"))
             lbl_verdict.pack(pady=(5, 15))
 
-            # Сразу показываем оригинальную картинку, чтобы интерфейс не казался зависшим
             self.display_image(path, lbl_orig)
 
-            # Сохраняем ссылки на элементы UI, чтобы передать их в поток анализа
             tasks.append({
                 "path": path,
                 "lbl_res": lbl_res,
                 "lbl_verdict": lbl_verdict
             })
 
-        # Запускаем пакетную обработку в отдельном потоке
         threading.Thread(target=self.run_batch_inference, args=(tasks,), daemon=True).start()
 
     def run_batch_inference(self, tasks):
-        # Обрабатываем снимки по очереди
         for task in tasks:
             path = task["path"]
             lbl_res = task["lbl_res"]
             lbl_verdict = task["lbl_verdict"]
 
-            # Обновляем UI: показываем, что именно этот снимок сейчас в работе
             self.after(0, lambda lr=lbl_res, lv=lbl_verdict: self._set_analyzing_state(lr, lv))
 
             try:
@@ -235,25 +270,23 @@ class XRayStandaloneApp(ctk.CTk):
                 else:
                     image_array = np.array(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
 
-                result = self.detector.predict(image_array, return_visualization=True)
+                # Вызов нового API предсказания
+                result = self.detector.predict(image_array)
 
-                gradcam_base64 = None
-                if self.use_gradcam_var.get() and self.gradcam is not None:
-                    image_size = self.detector.config.image_size
-                    image_resized = cv2.resize(image_array, (image_size, image_size))
-                    overlay = self.gradcam.visualize(image_resized)
-                    original_h, original_w = image_array.shape[:2]
-                    overlay = cv2.resize(overlay, (original_w, original_h))
-                    gradcam_base64 = encode_image_to_base64(overlay)
+                heatmap_base64 = None
+                if self.use_heatmap_var.get() and result["count_objects"] > 0:
+                    overlay = generate_heatmap_overlay(image_array, result["predictions"])
+                    heatmap_base64 = encode_image_to_base64(overlay)
+                else:
+                    # Если галочка снята или переломов нет, показываем оригинал (в base64 для единообразия)
+                    heatmap_base64 = encode_image_to_base64(image_array)
 
-                # Используем default arguments в lambda, чтобы зафиксировать значения переменных в цикле
-                self.after(0, lambda r=result, g=gradcam_base64, lr=lbl_res, lv=lbl_verdict:
-                self.update_row_success(r, g, lr, lv))
+                self.after(0, lambda r=result, hb=heatmap_base64, lr=lbl_res, lv=lbl_verdict:
+                self.update_row_success(r, hb, lr, lv))
 
             except Exception as e:
                 print(f"Error analyzing {path}: {e}")
-                self.after(0, lambda lr=lbl_res, lv=lbl_verdict:
-                self._set_error_state(lr, lv))
+                self.after(0, lambda lr=lbl_res, lv=lbl_verdict: self._set_error_state(lr, lv))
 
     def _set_analyzing_state(self, lbl_res, lbl_verdict):
         lbl_res.configure(image=self.empty_ctk_img, text="Анализ нейросетью...")
@@ -263,30 +296,30 @@ class XRayStandaloneApp(ctk.CTk):
         lbl_res.configure(image=self.empty_ctk_img, text="Ошибка обработки")
         lbl_verdict.configure(text="ОШИБКА", text_color=COLOR_ALERT)
 
-    def update_row_success(self, result, gradcam_base64, lbl_res, lbl_verdict):
-        is_fracture = result.get("has_fracture", False)
-        conf = result.get("confidence", 0.0) * 100
-
-        img_b64_str = gradcam_base64 if gradcam_base64 else result.get("processed_image")
+    def update_row_success(self, result, image_base64, lbl_res, lbl_verdict):
+        # Новый парсинг результатов
+        count = result.get("count_objects", 0)
+        is_fracture = count > 0
+        preds = result.get("predictions", [])
+        conf = preds[0]["confidence"] * 100 if preds else 0.0
 
         if is_fracture:
-            text = f"🚨 ПЕРЕЛОМ ОБНАРУЖЕН ({conf:.1f}%)"
+            text = f"🚨 НАЙДЕНО ПЕРЕЛОМОВ: {count} (Уверенность: {conf:.1f}%)"
             color = COLOR_ALERT
         else:
-            text = f"✅ ПАТОЛОГИЙ НЕ НАЙДЕНО ({conf:.1f}%)"
+            text = f"✅ ПАТОЛОГИЙ НЕ НАЙДЕНО"
             color = COLOR_OK
 
         lbl_verdict.configure(text=text, text_color=color)
 
-        if img_b64_str:
+        if image_base64:
             try:
-                img_bytes = base64.b64decode(img_b64_str)
+                img_bytes = base64.b64decode(image_base64)
                 pil_img = Image.open(io.BytesIO(img_bytes))
-                # Чуть уменьшил размер до 400, чтобы удобнее скроллилось
                 pil_img.thumbnail((400, 400))
                 ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=pil_img.size)
 
-                self.image_refs.append(ctk_img)  # Спасаем от сборщика мусора
+                self.image_refs.append(ctk_img)
                 lbl_res.configure(image=ctk_img, text="")
             except Exception as e:
                 print(f"Image display error: {e}")
