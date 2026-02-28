@@ -8,4 +8,4 @@ pydantic>=1.10.0
 pydicom>=2.3.0
 customtkinter
 pyinstaller
-
+onnxruntime
