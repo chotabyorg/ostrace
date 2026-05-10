@@ -1,21 +1,34 @@
 import base64
 import logging
-import os
+from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Union
 
-import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile
+import cv2
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from PIL import Image
 
 try:
     from .inference import OsTraceDetector
+    from .safety import (
+        classify_upload,
+        decode_image_bytes,
+        get_cors_origins,
+        read_limited_upload,
+        validate_dicom_dimensions,
+    )
 except ImportError:
     from inference import OsTraceDetector
+    from safety import (
+        classify_upload,
+        decode_image_bytes,
+        get_cors_origins,
+        read_limited_upload,
+        validate_dicom_dimensions,
+    )
 
 try:
     import pydicom
@@ -25,20 +38,6 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-webapp = FastAPI(
-    title="OsTrace Web",
-    description="On-prem fracture detection",
-    version="2.0.0",
-)
-
-webapp.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 offline_detector: Optional[OsTraceDetector] = None
 
@@ -85,8 +84,8 @@ def load_dicom(dicom_path):
     return pixel_array
 
 
-@webapp.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global offline_detector
     if OsTraceDetector.is_available():
         try:
@@ -98,6 +97,23 @@ async def startup_event():
     else:
         logger.warning("No ONNX model found. Place a .onnx file in ostracemodel/")
     logger.info("OsTrace Web started.")
+    yield
+
+
+webapp = FastAPI(
+    title="OsTrace Web",
+    description="On-prem fracture detection",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+webapp.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 HTML_TEMPLATE = """
@@ -767,22 +783,19 @@ async def api_predict(file: UploadFile = File(...)):
         )
 
     try:
-        image_bytes = await file.read()
-        filename = file.filename.lower() if file.filename else ""
-        is_dicom_file = filename.endswith('.dcm') or filename.endswith('.dicom')
+        image_bytes = await read_limited_upload(file)
+        file_kind = classify_upload(file.filename, file.content_type)
 
-        if is_dicom_file:
+        if file_kind == "dicom":
             if not HAS_PYDICOM:
                 return JSONResponse(
                     {"error": "DICOM support not available. Install pydicom: pip install pydicom"},
                     status_code=400,
                 )
+            validate_dicom_dimensions(image_bytes)
             image_array = load_dicom(image_bytes)
         else:
-            image_array = np.array(
-                Image.open(BytesIO(image_bytes)).convert("RGB"),
-                dtype=np.float32,
-            ) / 255.0
+            image_array = decode_image_bytes(image_bytes)
 
         result = offline_detector.predict(image_array)
         preds = result.get("predictions", [])
@@ -795,11 +808,13 @@ async def api_predict(file: UploadFile = File(...)):
             "predictions": preds,
             "original_image": original_base64,
         }
-    except Exception as e:
-        logger.error(f"Prediction error: {e}")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Prediction error")
         import traceback
         logger.error(traceback.format_exc())
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse({"error": "Prediction failed. Check the uploaded file and server logs."}, status_code=400)
 
 
 if __name__ == "__main__":

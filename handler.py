@@ -1,19 +1,33 @@
 import base64
 import logging
+from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from PIL import Image
 
 try:
     from .inference import OsTraceDetector
+    from .safety import (
+        classify_upload,
+        decode_image_bytes,
+        get_cors_origins,
+        read_limited_upload,
+        validate_dicom_dimensions,
+    )
 except ImportError:
     from inference import OsTraceDetector
+    from safety import (
+        classify_upload,
+        decode_image_bytes,
+        get_cors_origins,
+        read_limited_upload,
+        validate_dicom_dimensions,
+    )
 
 try:
     import pydicom
@@ -24,21 +38,11 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="OsTrace API", version="2.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 detector: Optional[OsTraceDetector] = None
 
 
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global detector
     if OsTraceDetector.is_available():
         try:
@@ -48,6 +52,18 @@ async def startup():
             logger.error(f"Загрузка детектора был неуспешна: {e}")
     else:
         logger.warning("Не найдено .onnx модели")
+    yield
+
+
+app = FastAPI(title="OsTrace API", version="2.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def encode_image_to_base64(image: np.ndarray) -> str:
@@ -122,46 +138,45 @@ async def predict(file: UploadFile = File(...)):
         return JSONResponse({"error": "Модель не загружена"}, status_code=503)
 
     try:
-        image_bytes = await file.read()
-        fname = (file.filename or "").lower()
-        is_dicom = fname.endswith(".dcm") or fname.endswith(".dicom")
+        image_bytes = await read_limited_upload(file)
+        file_kind = classify_upload(file.filename, file.content_type)
 
-        if is_dicom:
+        if file_kind == "dicom":
             if not HAS_PYDICOM:
                 return JSONResponse({"error": "pydicom не установлен"}, status_code=400)
+            validate_dicom_dimensions(image_bytes)
             image_array = load_dicom(image_bytes)
         else:
-            image_array = np.array(
-                Image.open(BytesIO(image_bytes)).convert("RGB"),
-                dtype=np.float32,
-            ) / 255.0
+            image_array = decode_image_bytes(image_bytes)
 
         result = detector.predict(image_array)
-        preds = result["predictions"]
-        count = result["count_objects"]
-
-        has_fracture = count > 0
-        confidence = preds[0]["confidence"] if preds else 0.0
-
-        overlay = generate_heatmap_overlay(image_array, preds)
-        processed_image = encode_image_to_base64(overlay)
+        preds = result.get("predictions", [])
+        count = result.get("count_objects", 0)
+        original_base64 = encode_image_to_base64(image_array)
 
         return {
-            "has_fracture": has_fracture,
-            "confidence": round(confidence, 4),
-            "processed_image": processed_image,
+            "count_objects": count,
+            "predictions": preds,
+            "original_image": original_base64,
         }
 
-    except Exception as e:
-        logger.error(f"Prediction error: {e}")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Prediction error")
         import traceback
         logger.error(traceback.format_exc())
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse({"error": "Prediction failed. Check the uploaded file and server logs."}, status_code=400)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "model_loaded": detector is not None}
+    return {
+        "status": "healthy",
+        "detector_ready": detector is not None,
+        "model_loaded": detector is not None,
+        "dicom_support": HAS_PYDICOM,
+    }
 
 
 if __name__ == "__main__":

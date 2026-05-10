@@ -216,9 +216,18 @@ http://127.0.0.1:8090
 
 ## Команды для разработки
 
+Если нужно запускать тесты, установите dev-зависимости:
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
 ```bash
 # Проверить синтаксис Python-файлов
 python -m compileall .
+
+# Запустить тесты
+python -m pytest
 
 # Запустить веб-интерфейс
 python -m uvicorn webapp:webapp --host 127.0.0.1 --port 8080 --reload

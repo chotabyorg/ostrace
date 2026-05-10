@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ostrace"
+version = "2.0.0"
+description = "Local ONNX-based fracture detection API, web UI, and desktop client."
+readme = "README.md"
+requires-python = ">=3.9,<3.13"
+dependencies = [
+    "numpy>=1.21.0",
+    "opencv-python>=4.5.0",
+    "Pillow>=9.0.0",
+    "fastapi>=0.95.0",
+    "uvicorn>=0.21.0",
+    "python-multipart>=0.0.6",
+    "pydantic>=1.10.0",
+    "pydicom>=2.3.0",
+    "customtkinter",
+    "onnxruntime",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "httpx>=0.24.0",
+]
+
+[tool.setuptools]
+py-modules = ["app", "handler", "inference", "safety", "webapp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
