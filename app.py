@@ -174,19 +174,24 @@ class XRayStandaloneApp(ctk.CTk):
             else:
                 base_dir = os.path.dirname(sys.executable)
         else:
-            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            base_dirs = [app_dir, os.path.abspath(os.path.join(app_dir, ".."))]
 
         # Ищем папку ostracemodel (новое дефолтное место) или models
-        for target_dir in ["ostracemodel", "models"]:
-            models_dir = os.path.join(base_dir, target_dir)
-            if os.path.exists(models_dir):
-                for file in os.listdir(models_dir):
-                    if file.endswith(".onnx"):
-                        print(f"Найдена модель по умолчанию: {models_dir}")
-                        self.btn_load_model.configure(state="disabled")
-                        self.status_label.configure(text="Авто-загрузка ONNX...", text_color=COLOR_WARN)
-                        threading.Thread(target=self._init_model_backend, args=(models_dir,), daemon=True).start()
-                        return
+        if getattr(sys, 'frozen', False):
+            base_dirs = [base_dir]
+
+        for base_dir in base_dirs:
+            for target_dir in ["ostracemodel", "models"]:
+                models_dir = os.path.join(base_dir, target_dir)
+                if os.path.exists(models_dir):
+                    for file in os.listdir(models_dir):
+                        if file.endswith(".onnx"):
+                            print(f"Найдена модель по умолчанию: {models_dir}")
+                            self.btn_load_model.configure(state="disabled")
+                            self.status_label.configure(text="Авто-загрузка ONNX...", text_color=COLOR_WARN)
+                            threading.Thread(target=self._init_model_backend, args=(models_dir,), daemon=True).start()
+                            return
 
         print("Папка с .onnx моделью не найдена. Ждем ручной загрузки.")
 

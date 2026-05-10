@@ -10,7 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
 
-from .inference import OsTraceDetector
+try:
+    from .inference import OsTraceDetector
+except ImportError:
+    from inference import OsTraceDetector
 
 try:
     import pydicom

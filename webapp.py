@@ -9,10 +9,13 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from PIL import Image
 
-from .inference import OsTraceDetector
+try:
+    from .inference import OsTraceDetector
+except ImportError:
+    from inference import OsTraceDetector
 
 try:
     import pydicom
@@ -93,7 +96,7 @@ async def startup_event():
             logger.error(f"ONNX detector init failed: {e}")
             offline_detector = None
     else:
-        logger.warning("No ONNX model found. Place weights.onnx in exported_models_v5/")
+        logger.warning("No ONNX model found. Place a .onnx file in ostracemodel/")
     logger.info("OsTrace Web started.")
 
 
@@ -689,6 +692,14 @@ async def root():
     return HTML_TEMPLATE
 
 
+@webapp.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    icon_path = Path(__file__).parent / "OsTrace.ico"
+    if icon_path.exists():
+        return FileResponse(icon_path)
+    return Response(status_code=204)
+
+
 @webapp.get("/health")
 async def health():
     return {
@@ -751,7 +762,7 @@ def generate_heatmap_from_bboxes(
 async def api_predict(file: UploadFile = File(...)):
     if offline_detector is None:
         return JSONResponse(
-            {"error": "ONNX model not loaded. Place weights.onnx in exported_models_v5/"},
+            {"error": "ONNX model not loaded. Place a .onnx file in ostracemodel/"},
             status_code=503,
         )
 

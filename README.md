@@ -1,148 +1,228 @@
-# OsTrace — Обнаружение и локализация переломов
+# OsTrace
 
-Многозадачная модель глубокого обучения для обнаружения и локализации костных аномалий на рентгеновских снимках.
+OsTrace - локальный инструмент для обнаружения и визуализации возможных переломов на рентгеновских снимках. Проект работает с ONNX-моделью, умеет принимать обычные изображения и DICOM-файлы, предоставляет веб-интерфейс, FastAPI API и отдельное desktop-приложение на CustomTkinter.
 
-## Возможности
+Важно: результат модели не является медицинским диагнозом. Используйте его только как вспомогательный инструмент.
 
-- Классификация переломов (бинарная классификация)
-- Локализация переломов (маска сегментации)
-- Визуализация внимания Grad-CAM
-- EfficientNetV2 backbone с механизмами внимания
-- REST API для инференса
-- Веб-интерфейс для тестирования
-- Функционал загрузки модели
+## Что есть в проекте
 
-## Установка
+- `webapp.py` - веб-интерфейс и API `/api/predict`.
+- `handler.py` - минимальный FastAPI API без HTML-интерфейса.
+- `app.py` - standalone desktop UI.
+- `inference.py` - загрузка ONNX-модели, preprocess, postprocess и NMS.
+- `ostracemodel/` - ожидаемая папка для ONNX-модели. Ее нужно создать вручную, если ее нет.
 
-```bash
-pip install -r requirements.txt
-```
+## Требования
 
-## Использование
+- Python 3.9-3.12.
+- ONNX-модель OsTrace в формате `.onnx`.
+- Для DICOM-файлов нужен `pydicom` - он уже указан в `requirements.txt`.
 
-### Python API
+На Python 3.13+ часть ML-зависимостей может быть недоступна или работать нестабильно, поэтому для обычной установки лучше использовать Python 3.10-3.12.
 
-```python
-from ostrace import FractureDetector, Config
+## Быстрый старт
 
-# Загрузка модели
-config = Config(model_path="path/to/model.keras")
-detector = FractureDetector(config)
-
-# Предсказание
-result = detector.predict("xray_image.jpg")
-print(f"Перелом обнаружен: {result['has_fracture']}")
-print(f"Уверенность: {result['confidence']}")
-```
-
-### REST API
-
-Запуск сервера:
+### 1. Склонировать репозиторий
 
 ```bash
-# Только API
-python -m ostrace.handler
-
-# или через uvicorn
-uvicorn ostrace.handler:app --host 0.0.0.0 --port 8000
+git clone https://github.com/chotabyorg/ostrace.git
+cd ostrace
 ```
 
-### Веб-интерфейс(ПЛЕЙСХОЛДЕР!)
+### 2. Создать виртуальное окружение
 
-Запуск веб-интерфейса:
+macOS / Linux:
 
 ```bash
-# Веб-интерфейс
-python -m ostrace.webapp
-
-# или через uvicorn
-uvicorn ostrace.webapp:webapp --host 0.0.0.0 --port 8080
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-Открывать через http://localhost:8080 в браузере.
+Windows PowerShell:
 
-## Эндпоинты
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
 
-### POST /models/upload
-
-Загрузка файла модели.
+### 3. Установить зависимости
 
 ```bash
-curl -X POST -F "file=@model.keras" -F "backbone=efficientnetv2-b3" http://localhost:8000/models/upload
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Ответ:
-```json
-{
-  "status": "success",
-  "current_model": "model.keras",
-  "config": {
-    "image_size": 224,
-    "mask_size": 224,
-    "backbone": "efficientnetv2-b3"
-  }
-}
-```
+### 4. Добавить модель
 
-### POST /predict
-
-Предсказание перелома по изображению в base64.
+Создайте папку `ostracemodel` в корне проекта и положите туда ONNX-файл:
 
 ```bash
-curl -X POST -F "image=<base64_image>" http://localhost:8000/predict
+mkdir -p ostracemodel
 ```
 
-Ответ:
-```json
-{
-  "has_fracture": true,
-  "confidence": 0.87,
-  "processed_image": "<base64>",
-  "gradcam_image": "<base64>"
-}
+Пример структуры:
+
+```text
+ostrace/
+  ostracemodel/
+    model.onnx
+  webapp.py
+  inference.py
 ```
 
-### POST /predict/upload
+Имя ONNX-файла может быть любым, но в папке лучше держать одну актуальную модель, потому что приложение загружает первый найденный `.onnx` файл.
 
-Предсказание по загруженному файлу.
+Ссылка на модель из исходного проекта:
+
+```text
+https://drive.google.com/drive/folders/1Ca2TZxPPA1fqemfrkBNGnZc9nEtEmqX5?usp=sharing
+```
+
+## Запуск веб-интерфейса
 
 ```bash
-curl -X POST -F "file=@xray.jpg" http://localhost:8000/predict/upload
+python -m uvicorn webapp:webapp --host 127.0.0.1 --port 8080 --reload
 ```
 
-### GET /health
+Откройте в браузере:
 
-Проверка состояния API.
+```text
+http://127.0.0.1:8080
+```
+
+В интерфейсе можно загрузить `.jpg`, `.jpeg`, `.png`, `.dcm` или `.dicom` файл. Если модель не найдена, сверху будет статус "Модель не найдена", а анализ будет недоступен.
+
+## Запуск минимального API
+
+Если HTML-интерфейс не нужен:
 
 ```bash
-curl http://localhost:8000/health
+python -m uvicorn handler:app --host 127.0.0.1 --port 8080 --reload
 ```
 
-Ответ:
+Проверка состояния:
+
+```bash
+curl http://127.0.0.1:8080/health
+```
+
+## API веб-приложения
+
+### `GET /health`
+
+Возвращает состояние веб-приложения:
+
 ```json
 {
   "status": "healthy",
-  "model_loaded": true,
-  "current_model": "model.keras"
+  "detector_ready": true,
+  "dicom_support": true
 }
 ```
 
-## Ссылка на гдрайв с моделью
-```json
-https://drive.google.com/drive/folders/1Ca2TZxPPA1fqemfrkBNGnZc9nEtEmqX5?usp=sharing
+`detector_ready: false` означает, что `.onnx` модель не найдена или не загрузилась.
+
+### `POST /api/predict`
+
+Принимает файл снимка через multipart form-data:
+
+```bash
+curl -X POST \
+  -F "file=@xray.jpg" \
+  http://127.0.0.1:8080/api/predict
 ```
-## Требования
 
-- Python 3.9+
-- TensorFlow 2.16+
-- Keras 3.10+
-- FastAPI
-- OpenCV
-- Pillow
-- pydantic 
-- pydicom
+Пример ответа:
 
+```json
+{
+  "count_objects": 1,
+  "predictions": [
+    {
+      "x": 230.5,
+      "y": 180.2,
+      "width": 75.0,
+      "height": 62.0,
+      "confidence": 0.87,
+      "class": "fracture",
+      "class_id": 1
+    }
+  ],
+  "original_image": "<base64>"
+}
+```
 
+## Запуск desktop-приложения
 
+```bash
+python app.py
+```
 
+Desktop UI автоматически ищет `.onnx` модель в папках `ostracemodel/` и `models/`. Также модель можно выбрать вручную кнопкой "Загрузить модель".
 
+## Частые проблемы
+
+### `ONNX model not loaded`
+
+Проверьте, что файл модели лежит здесь:
+
+```text
+ostrace/ostracemodel/*.onnx
+```
+
+После добавления модели перезапустите сервер.
+
+### `onnxruntime не установлен`
+
+Установите зависимости заново в активированном виртуальном окружении:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+### Не открываются DICOM-файлы
+
+Проверьте, что установлен `pydicom`:
+
+```bash
+python -m pip install pydicom
+```
+
+### Порт 8080 занят
+
+Запустите на другом порту:
+
+```bash
+python -m uvicorn webapp:webapp --host 127.0.0.1 --port 8090 --reload
+```
+
+И откройте:
+
+```text
+http://127.0.0.1:8090
+```
+
+## Команды для разработки
+
+```bash
+# Проверить синтаксис Python-файлов
+python -m compileall .
+
+# Запустить веб-интерфейс
+python -m uvicorn webapp:webapp --host 127.0.0.1 --port 8080 --reload
+
+# Запустить минимальный API
+python -m uvicorn handler:app --host 127.0.0.1 --port 8080 --reload
+
+# Запустить desktop UI
+python app.py
+```
+
+## Примечания по модели
+
+`inference.py` ожидает, что ONNX-модель возвращает:
+
+1. bbox-координаты в нормализованном формате `cx, cy, width, height`;
+2. logits/score-выход для классов.
+
+Код поддерживает бинарный и многоклассовый score-выход. Если ваша модель экспортирована с другим форматом выходов, нужно адаптировать `postprocess()` в `inference.py`.

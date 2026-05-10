@@ -59,8 +59,8 @@ class OsTraceDetector:
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
         self.input_shape = inp.shape
-        self.input_h = self.input_shape[2] if len(self.input_shape) >= 3 else 560
-        self.input_w = self.input_shape[3] if len(self.input_shape) >= 4 else 560
+        self.input_h = self._shape_dim(self.input_shape, 2, 560)
+        self.input_w = self._shape_dim(self.input_shape, 3, 560)
 
         output_names = [o.name for o in self.session.get_outputs()]
         logger.info(
@@ -68,6 +68,13 @@ class OsTraceDetector:
             f"input={self.input_name} shape={self.input_shape}, "
             f"outputs={output_names}"
         )
+
+    @staticmethod
+    def _shape_dim(shape: List[Any], index: int, fallback: int) -> int:
+        if len(shape) <= index:
+            return fallback
+        value = shape[index]
+        return value if isinstance(value, int) and value > 0 else fallback
 
     IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -114,7 +121,14 @@ class OsTraceDetector:
 
         probs = 1.0 / (1.0 + np.exp(-labels_logits))
 
-        fracture_scores = np.maximum(probs[:, 1], probs[:, 2])
+        if probs.ndim == 1:
+            fracture_scores = probs
+        elif probs.shape[1] >= 3:
+            fracture_scores = np.maximum(probs[:, 1], probs[:, 2])
+        elif probs.shape[1] >= 2:
+            fracture_scores = probs[:, 1]
+        else:
+            fracture_scores = probs[:, 0]
 
         mask = fracture_scores >= conf_threshold
         if not mask.any():
