@@ -4,6 +4,20 @@ OsTrace - локальный инструмент для обнаружения 
 
 Важно: результат модели не является медицинским диагнозом. Используйте его только как вспомогательный инструмент.
 
+## Где скачать модель
+
+Модель не хранится в репозитории, потому что файл весит слишком много. Скачайте ONNX-модель из Google Drive:
+
+**[Скачать модель OsTrace из Google Drive](https://drive.google.com/drive/folders/1Ca2TZxPPA1fqemfrkBNGnZc9nEtEmqX5?usp=sharing)**
+
+Прямая ссылка, если кнопка выше не открывается:
+
+```text
+https://drive.google.com/drive/folders/1Ca2TZxPPA1fqemfrkBNGnZc9nEtEmqX5?usp=sharing
+```
+
+После скачивания положите файл `.onnx` в папку `ostracemodel/` в корне проекта.
+
 ## Что есть в проекте
 
 - `webapp.py` - веб-интерфейс и API `/api/predict`.
@@ -54,7 +68,11 @@ python -m pip install -r requirements.txt
 
 ### 4. Добавить модель
 
-Создайте папку `ostracemodel` в корне проекта и положите туда ONNX-файл:
+Скачайте ONNX-модель из Google Drive:
+
+**[Скачать модель OsTrace из Google Drive](https://drive.google.com/drive/folders/1Ca2TZxPPA1fqemfrkBNGnZc9nEtEmqX5?usp=sharing)**
+
+Затем создайте папку `ostracemodel` в корне проекта и положите туда скачанный `.onnx` файл:
 
 ```bash
 mkdir -p ostracemodel
@@ -71,12 +89,6 @@ ostrace/
 ```
 
 Имя ONNX-файла может быть любым, но в папке лучше держать одну актуальную модель, потому что приложение загружает первый найденный `.onnx` файл.
-
-Ссылка на модель из исходного проекта:
-
-```text
-https://drive.google.com/drive/folders/1Ca2TZxPPA1fqemfrkBNGnZc9nEtEmqX5?usp=sharing
-```
 
 ## Запуск веб-интерфейса
 
